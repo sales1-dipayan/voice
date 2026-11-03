@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Voice note</title>
+<style>
+:root{--navy:#0f2b46;--accent:#1f6feb;--red:#c62828;--ink:#1d2939;--muted:#667085;--line:#e4e7ec;--bg:#f5f7fb}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink);min-height:100vh;display:flex;flex-direction:column}
+header{background:var(--navy);color:#fff;padding:12px 16px;font-weight:650}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px 16px;text-align:center}
+.mic{width:120px;height:120px;border-radius:50%;border:0;background:var(--accent);color:#fff;font-size:15px;font-weight:700;cursor:pointer;box-shadow:0 6px 18px rgba(31,111,235,.35)}
+.mic.on{background:var(--red);box-shadow:0 0 0 0 rgba(198,40,40,.5);animation:pulse 1.4s infinite}
+.mic.paused{background:#98a2b3;animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(198,40,40,.45)}70%{box-shadow:0 0 0 22px rgba(198,40,40,0)}100%{box-shadow:0 0 0 0 rgba(198,40,40,0)}}
+.time{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums}
+.hint{color:var(--muted);font-size:14px;max-width:340px;line-height:1.45}
+.meter{width:220px;height:8px;border-radius:4px;background:var(--line);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:#12b76a;transition:width .08s}
+.row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+.btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;padding:11px 18px;font-size:15px;font-weight:600;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn:disabled{opacity:.5;cursor:default}
+.err{background:#fdecec;color:var(--red);border:1px solid #f3c3c3;border-radius:8px;padding:10px 12px;max-width:360px;font-size:14px;line-height:1.45}
+.hidden{display:none!important}
+audio{width:280px;max-width:100%}
+a.dl{font-size:14px}
+</style>
+</head>
+<body>
+<header>Voice note</header>
+<main>
+  <div class="hint" id="hint">Tap the button and speak in Hindi, Bengali or English, then tap Done. The app keeps the recording and writes it as a professional English comment.</div>
+  <button class="mic" id="mic" type="button">Tap to record</button>
+  <div class="time" id="time">0:00</div>
+  <div class="meter" id="meterBox"><i id="meter"></i></div>
+  <div class="row">
+    <button class="btn hidden" id="pause" type="button">Pause</button>
+    <button class="btn primary hidden" id="stop" type="button">Done</button>
+  </div>
+  <div class="row hidden" id="review">
+    <audio id="play" controls></audio>
+  </div>
+  <div class="row hidden" id="reviewActs">
+    <button class="btn" id="again" type="button">Record again</button>
+    <button class="btn primary" id="send" type="button">Use this recording</button>
+  </div>
+  <div class="err hidden" id="err"></div>
+  <a class="dl hidden" id="dl" download>Save the recording on this device</a>
+  <button class="btn" id="cancel" type="button">Cancel</button>
+</main>
+<script>
+(function () {
+  var MAX_MS = 10 * 60 * 1000;
+  var params = {};
+  String(location.hash || '').replace(/^#/, '').split(',').forEach(function (kv) {
+    var i = kv.indexOf('=');
+    if (i > 0) params[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+  });
+  var nonce = params.n || '';
+  var target = params.o || '';
+  /* only an app frame of Google Apps Script (or a test page on this computer) gets the recording, and only that window */
+  var okTarget = /^https:[/][/][a-z0-9-]+-script[.]googleusercontent[.]com$/i.test(target) || /^http:[/][/](localhost|127[.]0[.]0[.]1)(:[0-9]+)?$/i.test(target);
+  var opener = window.opener || null;
+  var $ = function (id) { return document.getElementById(id); };
+  var mic = $('mic'), time = $('time'), meter = $('meter'), stopB = $('stop'), pauseB = $('pause'), err = $('err');
+  var stream = null, rec = null, chunks = [], mime = '', t0 = 0, acc = 0, timer = 0, blob = null, dur = 0, ac = null, an = null, raf = 0, wantSend = false, acked = false;
+
+  function linked() { return !!(opener && !opener.closed && nonce && okTarget); }
+  function tell(msg) { if (linked()) { try { opener.postMessage(Object.assign({ src: 'ot-recorder', n: nonce }, msg), target); return true; } catch (e) { return false; } } return false; }
+  function showErr(t) { err.textContent = t; err.classList.remove('hidden'); }
+  function fmt(ms) { var s = Math.floor(ms / 1000); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+  function elapsed() { return acc + (t0 ? Date.now() - t0 : 0); }
+  function tick() {
+    var ms = elapsed();
+    time.textContent = fmt(ms);
+    if (ms >= MAX_MS) { wantSend = false; stop(); showErr('10 minutes is the most for one voice note. Listen, then tap "Use this recording".'); }
+  }
+  function pickMime() {
+    var list = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/aac'];
+    if (!window.MediaRecorder) return null;
+    for (var i = 0; i < list.length; i++) { try { if (MediaRecorder.isTypeSupported(list[i])) return list[i]; } catch (e) { } }
+    return '';
+  }
+  function level() {
+    if (!an) return;
+    var a = new Uint8Array(an.fftSize);
+    an.getByteTimeDomainData(a);
+    var peak = 0;
+    for (var i = 0; i < a.length; i++) { var v = Math.abs(a[i] - 128); if (v > peak) peak = v; }
+    meter.style.width = Math.min(100, Math.round(peak / 128 * 160)) + '%';
+    raf = requestAnimationFrame(level);
+  }
+  function start() {
+    err.classList.add('hidden');
+    var m = pickMime();
+    if (m === null || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showErr('This browser cannot record here. Use the voice recorder app of the phone, then "Voice note file" in the app.');
+      return;
+    }
+    mic.disabled = true; mic.textContent = 'Starting…';
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).then(function (s) {
+      stream = s; chunks = []; blob = null; acc = 0; wantSend = false;
+      var o = { audioBitsPerSecond: 32000 };
+      if (m) o.mimeType = m;
+      try { rec = new MediaRecorder(s, o); } catch (e) { rec = new MediaRecorder(s); }
+      mime = rec.mimeType || m || 'audio/webm';
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = finished;
+      rec.start(1000);
+      t0 = Date.now();
+      timer = setInterval(tick, 250);
+      try { ac = new (window.AudioContext || window.webkitAudioContext)(); an = ac.createAnalyser(); an.fftSize = 512; ac.createMediaStreamSource(s).connect(an); level(); } catch (e) { an = null; }
+      mic.disabled = false; mic.textContent = 'Recording'; mic.className = 'mic on';
+      stopB.classList.remove('hidden'); pauseB.classList.remove('hidden');
+      $('review').classList.add('hidden'); $('reviewActs').classList.add('hidden'); $('dl').classList.add('hidden');
+    }).catch(function (e) {
+      mic.disabled = false; mic.textContent = 'Tap to record';
+      var denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+      showErr(denied ? 'The microphone is blocked. Allow it for this page (the lock or mic sign next to the address), then tap to record.' : 'The microphone could not be used: ' + (e && e.message ? e.message : e));
+    });
+  }
+  function pause() {
+    if (!rec) return;
+    if (rec.state === 'recording') { rec.pause(); acc += Date.now() - t0; t0 = 0; pauseB.textContent = 'Resume'; mic.className = 'mic paused'; mic.textContent = 'Paused'; }
+    else if (rec.state === 'paused') { rec.resume(); t0 = Date.now(); pauseB.textContent = 'Pause'; mic.className = 'mic on'; mic.textContent = 'Recording'; }
+  }
+  function stop() {
+    if (!rec || rec.state === 'inactive') return;
+    dur = elapsed(); acc = dur; t0 = 0;
+    clearInterval(timer); cancelAnimationFrame(raf); meter.style.width = '0';
+    rec.stop();
+  }
+  function release() {
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    stream = null;
+    if (ac) { try { ac.close(); } catch (e) { } ac = null; an = null; }
+  }
+  function offerSave(t) {
+    $('review').classList.remove('hidden'); $('reviewActs').classList.remove('hidden'); $('dl').classList.remove('hidden');
+    mic.disabled = false; mic.textContent = 'Record again';
+    var b = $('send'); b.disabled = !linked(); b.textContent = 'Use this recording';
+    if (t) showErr(t);
+  }
+  function finished() {
+    release();
+    blob = new Blob(chunks, { type: mime.split(';')[0] });
+    mic.className = 'mic'; mic.textContent = 'Record again';
+    stopB.classList.add('hidden'); pauseB.classList.add('hidden'); pauseB.textContent = 'Pause';
+    if (dur < 800 || !blob.size) { showErr('Nothing was recorded. Tap to record again.'); mic.textContent = 'Tap to record'; return; }
+    var url = URL.createObjectURL(blob);
+    $('play').src = url;
+    var dl = $('dl'); dl.href = url; dl.download = 'voice-note.' + (/mp4|aac/.test(mime) ? 'm4a' : (/ogg/.test(mime) ? 'ogg' : 'webm'));
+    if (wantSend && linked()) { send(); return; }   /* Done = like dictation: it goes back to the app */
+    offerSave(linked() ? '' : 'This window is not linked to the app any more. Save the recording, then attach it in the app with "Voice note file".');
+  }
+  /* a 16 kHz (8 kHz when long) mono WAV copy for the AI, which reads WAV everywhere; the small recording stays the one kept */
+  function b64(bytes) {
+    var s = '', CH = 0x8000;
+    for (var i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    return btoa(s);
+  }
+  function toWav(cb) {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext, OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      if (!AC || !OAC || !blob.arrayBuffer) return cb('');
+      blob.arrayBuffer().then(function (buf) {
+        var ctx = new AC();
+        var done = function (ab) {
+          try { ctx.close(); } catch (e) { }
+          var rate = ab.duration <= 300 ? 16000 : 8000;
+          var off = new OAC(1, Math.max(1, Math.ceil(ab.duration * rate)), rate), src = off.createBufferSource();
+          src.buffer = ab; src.connect(off.destination); src.start(0);
+          off.startRendering().then(function (r) {
+            var pcm = r.getChannelData(0), n = pcm.length, out = new DataView(new ArrayBuffer(44 + n * 2));
+            var str = function (o, t) { for (var i = 0; i < t.length; i++) out.setUint8(o + i, t.charCodeAt(i)); };
+            str(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+            out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true); str(36, 'data'); out.setUint32(40, n * 2, true);
+            for (var i = 0; i < n; i++) { var v = Math.max(-1, Math.min(1, pcm[i])); out.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7FFF, true); }
+            cb(b64(new Uint8Array(out.buffer)));
+          }).catch(function () { cb(''); });
+        };
+        var p = ctx.decodeAudioData(buf, done, function () { cb(''); });
+        if (p && p.catch) p.catch(function () { cb(''); });
+      }).catch(function () { cb(''); });
+    } catch (e) { cb(''); }
+  }
+  function send() {
+    if (!blob) return;
+    var b = $('send'); b.disabled = true; b.textContent = 'Sending…'; mic.disabled = true; mic.textContent = 'Sending…';
+    var fr = new FileReader();
+    fr.onload = function () {
+      var data = String(fr.result).split(',')[1] || '';
+      toWav(function (wav) {
+        acked = false;
+        if (!tell({ type: 'audio', mime: mime.split(';')[0], data: data, ms: dur, wav: wav })) { offerSave('The app window was closed. Save the recording, then attach it in the app with "Voice note file".'); return; }
+        /* closes only when the app confirms it has the recording */
+        setTimeout(function () { if (!acked) offerSave('The app did not confirm it got the recording. Tap "Use this recording" again, or save it and attach it with "Voice note file".'); }, 5000);
+      });
+    };
+    fr.onerror = function () { offerSave('The recording could not be read.'); };
+    fr.readAsDataURL(blob);
+  }
+  window.addEventListener('message', function (e) {
+    var d = e.data || {};
+    if (e.origin !== target || e.source !== opener || d.src !== 'ot-app' || d.n !== nonce) return;
+    if (d.type === 'ack') { acked = true; mic.textContent = 'Sent'; setTimeout(function () { window.close(); }, 100); }
+  });
+  mic.addEventListener('click', function () {
+    if (rec && rec.state === 'recording') { wantSend = true; stop(); return; }
+    if (rec && rec.state === 'paused') { pause(); return; }
+    start();
+  });
+  pauseB.addEventListener('click', pause);
+  stopB.addEventListener('click', function () { wantSend = true; if (rec && rec.state !== 'inactive') stop(); });
+  $('again').addEventListener('click', start);
+  $('send').addEventListener('click', send);
+  $('cancel').addEventListener('click', function () { if (rec && rec.state !== 'inactive') { rec.onstop = null; try { rec.stop(); } catch (e) { } } release(); tell({ type: 'cancel' }); window.close(); });
+  window.addEventListener('beforeunload', function () { release(); });
+  if (!nonce || !okTarget) $('hint').textContent = 'Open this from the Record button in the Opportunity Tracker. You can still record here and save the file.';
+})();
+</script>
+</body>
+</html>
