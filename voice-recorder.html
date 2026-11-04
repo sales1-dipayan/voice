@@ -67,6 +67,18 @@ a.dl{font-size:14px}
   var $ = function (id) { return document.getElementById(id); };
   var mic = $('mic'), time = $('time'), meter = $('meter'), stopB = $('stop'), pauseB = $('pause'), err = $('err');
   var stream = null, rec = null, chunks = [], mime = '', t0 = 0, acc = 0, timer = 0, blob = null, dur = 0, ac = null, an = null, raf = 0, wantSend = false, acked = false;
+  /* a 16 kHz copy of the sound taken straight from the microphone while recording, for the AI (it reads WAV on every phone) */
+  var pcm = [], cur = null, curN = 0, pcmN = 0, sum = 0, cnt = 0, step = 0, proc = null;
+  function pcmReset() { pcm = []; cur = new Int16Array(16000); curN = 0; pcmN = 0; sum = 0; cnt = 0; step = 0; }
+  function pcmPush(v) {
+    v = Math.max(-1, Math.min(1, v));
+    cur[curN++] = v < 0 ? v * 0x8000 : v * 0x7FFF; pcmN++;
+    if (curN === cur.length) { pcm.push(cur); cur = new Int16Array(16000); curN = 0; }
+  }
+  function pcmFeed(input, rate) {
+    var r = rate / 16000;
+    for (var i = 0; i < input.length; i++) { sum += input[i]; cnt++; step += 1; if (step >= r) { step -= r; pcmPush(sum / cnt); sum = 0; cnt = 0; } }
+  }
 
   function linked() { return !!(opener && !opener.closed && nonce && okTarget); }
   function tell(msg) { if (linked()) { try { opener.postMessage(Object.assign({ src: 'ot-recorder', n: nonce }, msg), target); return true; } catch (e) { return false; } } return false; }
@@ -112,7 +124,17 @@ a.dl{font-size:14px}
       rec.start(1000);
       t0 = Date.now();
       timer = setInterval(tick, 250);
-      try { ac = new (window.AudioContext || window.webkitAudioContext)(); an = ac.createAnalyser(); an.fftSize = 512; ac.createMediaStreamSource(s).connect(an); level(); } catch (e) { an = null; }
+      pcmReset();
+      try {
+        ac = new (window.AudioContext || window.webkitAudioContext)(); an = ac.createAnalyser(); an.fftSize = 512;
+        var src = ac.createMediaStreamSource(s); src.connect(an); level();
+        if (ac.createScriptProcessor && ac.sampleRate >= 16000) {
+          proc = ac.createScriptProcessor(4096, 1, 1);
+          proc.onaudioprocess = function (ev) { if (rec && rec.state === 'recording') pcmFeed(ev.inputBuffer.getChannelData(0), ac.sampleRate); };
+          src.connect(proc); proc.connect(ac.destination);   /* silent: nothing is written to the output */
+        }
+        if (ac.resume) ac.resume();
+      } catch (e) { an = null; }
       mic.disabled = false; mic.textContent = 'Recording'; mic.className = 'mic on';
       stopB.classList.remove('hidden'); pauseB.classList.remove('hidden');
       $('review').classList.add('hidden'); $('reviewActs').classList.add('hidden'); $('dl').classList.add('hidden');
@@ -136,6 +158,7 @@ a.dl{font-size:14px}
   function release() {
     if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
     stream = null;
+    if (proc) { try { proc.disconnect(); } catch (e) { } proc.onaudioprocess = null; proc = null; }
     if (ac) { try { ac.close(); } catch (e) { } ac = null; an = null; }
   }
   function offerSave(t) {
@@ -162,7 +185,26 @@ a.dl{font-size:14px}
     for (var i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
     return btoa(s);
   }
+  function wavOf(samples, rate) {
+    var n = samples.length, out = new DataView(new ArrayBuffer(44 + n * 2));
+    var str = function (o, t) { for (var i = 0; i < t.length; i++) out.setUint8(o + i, t.charCodeAt(i)); };
+    str(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+    out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true); str(36, 'data'); out.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) out.setInt16(44 + i * 2, samples[i], true);
+    return b64(new Uint8Array(out.buffer));
+  }
+  /* the copy taken while recording (16 kHz; 8 kHz past 5 minutes) */
+  function wavFromMic() {
+    if (pcmN < 8000) return '';
+    var all = new Int16Array(pcmN), o = 0;
+    pcm.forEach(function (c) { all.set(c, o); o += c.length; }); all.set(cur.subarray(0, curN), o);
+    if (pcmN / 16000 <= 300) return wavOf(all, 16000);
+    var half = new Int16Array(Math.floor(pcmN / 2));
+    for (var i = 0; i < half.length; i++) half[i] = (all[2 * i] + all[2 * i + 1]) / 2;
+    return wavOf(half, 8000);
+  }
   function toWav(cb) {
+    try { var w = wavFromMic(); if (w) return cb(w); } catch (e) { }
     try {
       var AC = window.AudioContext || window.webkitAudioContext, OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
       if (!AC || !OAC || !blob.arrayBuffer) return cb('');
